@@ -33,7 +33,7 @@ ApiQ is a framework for quantizing and finetuning an LLM in low-bit format. It c
 - [x] 4 arithmetic reasoning tasks (GSM8K, SVAMP, MAWPS, AQuA)
 - [x] eight commonsense reasoning tasks (BoolQ, PIQA, SIQA, HellaSwag, WinoGrande, ARC-easy, ARC-challenge, OBQA)
 
-## News
+## Release log
 - [2024.06.19] Release of code
 
 ## Contents
