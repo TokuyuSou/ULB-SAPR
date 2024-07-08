@@ -23,8 +23,15 @@ ApiQ is a framework for quantizing and finetuning an LLM in low-bit format. It c
 
 
 ## Supports
-- ApiQ-bw for quantizing Llama-2 and Mistral-7B-v0.1 in 4, 3 and 2 bits
-- Fintuning of real/fake quantized LLM on WikiText-2, GSM8K, 4 arithmetic reasoning tasks and eight commonsense reasoning tasks
+- ApiQ-bw for quantizing the following LLMs in 4, 3 and 2 bits
+- [x] Llama-2
+- [x] Mistral-7B-v0.1
+
+- Fintuning of real/fake quantized LLM on 
+- [x] WikiText-2
+- [x] GSM8K
+- [x] 4 arithmetic reasoning tasks (GSM8K, SVAMP, MAWPS, AQuA)
+- [x] eight commonsense reasoning tasks (BoolQ, PIQA, SIQA, HellaSwag, WinoGrande, ARC-easy, ARC-challenge, OBQA)
 
 ## News
 - [2024.06.19] Release of code
