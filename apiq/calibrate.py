@@ -64,6 +64,8 @@ def calibrate(model, args, dataloader, logging=None):
             cache["attention_mask"] = kwargs["attention_mask"]
             if self.is_llama:
                 cache["position_ids"] = kwargs["position_ids"]
+                if "position_embeddings" in kwargs:
+                    cache["position_embeddings"] = kwargs["position_embeddings"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -105,8 +107,10 @@ def calibrate(model, args, dataloader, logging=None):
     loss_func = torch.nn.MSELoss()
     if is_llama:
         position_ids = cache["position_ids"]
+        position_embeddings = cache["position_embeddings"]
     else:
         position_ids = None
+        position_embeddings = None
 
     if args.resume:
         lwc_parameters = torch.load(os.path.join(args.resume, "lwc.pth"))
@@ -130,13 +134,15 @@ def calibrate(model, args, dataloader, logging=None):
                         fp_inps[j] = qlayer(
                             fp_inps[j].unsqueeze(0), 
                             attention_mask=attention_mask,
-                            position_ids=position_ids
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings
                         )[0]
                         if args.aug_loss:
                             fp_inps_2[j] = qlayer(
                                 quant_inps[j].unsqueeze(0), 
                                 attention_mask=attention_mask,
-                                position_ids=position_ids
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings
                             )[0]
 
         if args.resume:
@@ -164,7 +170,8 @@ def calibrate(model, args, dataloader, logging=None):
                         quant_out = qlayer(
                             quant_inps[index:index+args.batch_size,], 
                             attention_mask=attention_mask_batch,
-                            position_ids=position_ids
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings
                         )[0]
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
@@ -197,7 +204,8 @@ def calibrate(model, args, dataloader, logging=None):
                         quant_inps[j] = qlayer(
                             quant_inps[j].unsqueeze(0), 
                             attention_mask=attention_mask, 
-                            position_ids=position_ids
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings
                         )[0]
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
