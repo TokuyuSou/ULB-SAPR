@@ -5,12 +5,14 @@ import math
 import copy
 import torch
 import torch.nn as nn
+import numpy as np
 
 from apiq.utils import (
     set_quant_state,
     get_lwc_parameters,
     get_peft_parameters,
     get_apiq_parameters,
+    get_quantization_parameters,
     NativeScalerWithGradNormCount,
     register_scales_and_zeros,
     lwc_state_dict,
@@ -20,6 +22,8 @@ from apiq.utils import (
     quant_inplace,
     clear_temp_variable,
     quant_temporary,
+    get_learnable_parameters_from_class,
+    get_all_learnable_parameters,
 )
 
 try:
@@ -105,6 +109,10 @@ def calibrate(model, args, dataloader, logging=None):
         attention_mask_batch = None
 
     loss_func = torch.nn.MSELoss()
+
+    # Regularization term if needed
+    lambda_reg = args.lambda_reg if hasattr(args, 'lambda_reg') else 0
+
     if is_llama:
         position_ids = cache["position_ids"]
         position_embeddings = cache["position_embeddings"]
@@ -149,13 +157,37 @@ def calibrate(model, args, dataloader, logging=None):
             qlayer.load_state_dict(lwc_parameters[i], strict=False)
             qlayer.load_state_dict(peft_parameters[i], strict=False)
 
+        # Save initial quantization parameters
+        initial_params = {}
+        if args.regularization_target == "all":
+            for name, param in qlayer.named_parameters():
+                if param.requires_grad:
+                    initial_params[name] = param.detach().clone()
+        elif args.regularization_target == "quantization_params":
+            quantization_params = list(get_quantization_parameters(qlayer, args.quant_method, name=True))
+            for name, param in qlayer.named_parameters():
+                if param.requires_grad and name in quantization_params:
+                    initial_params[name] = param.detach().clone()
+                
+
         if args.epochs > 0:
             with torch.no_grad():
                 qlayer.float()  # required for AMP training
             # create optimizer
+            peft_params = {
+                "params": get_peft_parameters(qlayer, args.peft_method),
+                "lr": args.peft_lr,
+                "weight_decay": args.peft_wd,
+            }
+            quantization_params = {
+                "params": get_quantization_parameters(qlayer, args.quant_method),
+                "lr": args.lwc_lr,
+                "weight_decay": args.lwc_wd,
+            }
+
             optimizer = torch.optim.AdamW([
-                {"params": get_lwc_parameters(qlayer), "lr": args.lwc_lr, "weight_decay": args.lwc_wd},
-                {"params": get_peft_parameters(qlayer, args.peft_method), "lr": args.peft_lr, "weight_decay": args.peft_wd},
+                peft_params,
+                quantization_params
             ])
             loss_scaler = NativeScalerWithGradNormCount()
 
@@ -165,8 +197,9 @@ def calibrate(model, args, dataloader, logging=None):
                 for j in range(args.nsamples // args.batch_size):    
                     index = j * args.batch_size
                     with traincast():
-                        #set_quant_state(qlayer, weight_quant=True)
-                        quant_temporary(qlayer)
+                        set_quant_state(qlayer, weight_quant=True)
+                        if args.quant_method in ["default", "DB-LLM"]:
+                            quant_temporary(qlayer)
                         quant_out = qlayer(
                             quant_inps[index:index+args.batch_size,], 
                             attention_mask=attention_mask_batch,
@@ -176,14 +209,30 @@ def calibrate(model, args, dataloader, logging=None):
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+                    
+                    # Add regularization term
+                    reg_loss = 0
+                    if lambda_reg > 0:
+                        for name, param in qlayer.named_parameters():
+                            if param.requires_grad and name in initial_params:
+                                reg_loss += (param - initial_params[name]).pow(2).sum()
+                        reg_loss = lambda_reg * reg_loss
 
-                    if not math.isfinite(loss.item()):
+                    total_loss = loss + reg_loss
+
+                    if not math.isfinite(total_loss.item()):
                         logging.info("Loss is NAN, stopping training")
-                        pdb.set_trace()
+                        # pdb.set_trace()
 
-                    loss_list.append(loss.detach().cpu())
+                    loss_list.append(total_loss.detach().cpu())
                     optimizer.zero_grad()
-                    norm = loss_scaler(loss, optimizer, parameters=get_apiq_parameters(qlayer, args.peft_method)).cpu()
+                    norm = loss_scaler(
+                        total_loss,
+                        optimizer,
+                        parameters=get_all_learnable_parameters(
+                            qlayer, args.quant_method, args.peft_method
+                        ),
+                    ).cpu()
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
@@ -194,7 +243,8 @@ def calibrate(model, args, dataloader, logging=None):
             del optimizer
 
         qlayer.half()
-        quant_inplace(qlayer)
+        if args.quant_method in ["default", "DB-LLM"]:
+            quant_inplace(qlayer)
 
         if args.epochs>0:
             # update input of quantization model

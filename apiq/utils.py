@@ -1,7 +1,39 @@
 from math import inf
 from collections import OrderedDict
 import torch
-from apiq.quant_linear import QuantLinear
+from torch import nn
+from apiq.quant_linear import BaseQuantLinear, QuantLinear, BinaryMoSLinear
+
+METHOD_TO_KEYS = {
+    "default": ["bound_factor"],
+    "DB-LLM": ["alpha"],
+}
+
+def get_learnable_parameters_from_class(module: nn.Module, class_name: str, name: bool = False):
+    """
+    Retrieves all learnable parameters (requires_grad=True) of a specific class type within a given module.
+
+    Args:
+        module (nn.Module): The parent module to search in.
+        class_name (str): The name of the class whose learnable parameters are to be retrieved.
+        name (bool): If True, return the names of the parameters. If False, return the parameters themselves.
+
+    Returns:
+        List[nn.Parameter]: A list of learnable parameters with requires_grad=True.
+    """
+    learnable_params = []
+    for _, submodule in module.named_modules():
+        if submodule.__class__.__name__ == class_name:
+            # Filter parameters with requires_grad=True
+            if name:
+                learnable_params.extend(
+                    n for n, p in submodule.named_parameters() if p.requires_grad
+                )
+            else:
+                learnable_params.extend(
+                    p for p in submodule.parameters() if p.requires_grad
+                )
+    return iter(learnable_params)
 
 
 def quant_temporary(model):
@@ -63,14 +95,17 @@ def set_quant_state(self, weight_quant: bool = False):
     # setting weight quantization here does not affect actual forward pass
     self.use_weight_quant = weight_quant
     for n, m in self.named_modules():
-        if isinstance(m, QuantLinear):
+        if isinstance(m, BaseQuantLinear):
             m.set_quant_state(weight_quant)
 
-def get_lwc_parameters(model):
+def get_lwc_parameters(model, name=False):
     params = []
     for n, m in model.named_parameters():
         if n.find('bound_factor') > -1:
-            params.append(m)
+            if name:
+                params.append(n)
+            else:
+                params.append(m)
     return iter(params)
 
 def get_peft_parameters(model, peft_method):
@@ -84,6 +119,35 @@ def get_peft_parameters(model, peft_method):
             params.append(m)
     return iter(params)
 
+
+def get_quantization_parameters(model, quant_method, name=False):
+    if quant_method == "BinaryMoS":
+        return get_learnable_parameters_from_class(model, "BinaryMoSLinear", name)
+    elif quant_method in METHOD_TO_KEYS:
+        keys = METHOD_TO_KEYS[quant_method]
+        params = []
+        for n, m in model.named_parameters():
+            if any(key in n for key in keys):
+                if name:
+                    params.append(n)
+                else:
+                    params.append(m)
+        return iter(params)
+    else:
+        raise ValueError(f"Quantization method {quant_method} not supported")
+
+
+def get_all_learnable_parameters(model, quant_method, peft_method):
+    if quant_method == "BinaryMoS":
+        return get_binary_mos_parameters(model, peft_method)
+    elif quant_method in METHOD_TO_KEYS:
+        peft_params = get_peft_parameters(model, peft_method)
+        quantization_params = get_quantization_parameters(model, quant_method)
+        return iter(list(peft_params) + list(quantization_params))
+    else:
+        raise ValueError(f"Quantization method {quant_method} not supported")
+
+
 def get_apiq_parameters(model, peft_method):
     if peft_method == "LoRA" or peft_method == "DoRA":
         key = "lora"
@@ -95,11 +159,22 @@ def get_apiq_parameters(model, peft_method):
             params.append(m)
     return iter(params)
 
-def lwc_state_dict(model, destination=None, prefix='', keep_vars=False):
+
+def get_binary_mos_parameters(model, peft_method):
+    if peft_method == "LoRA" or peft_method == "DoRA":
+        key = "lora"
+    else:
+        raise ValueError("Only support LoRA and DoRA for now")
+    peft_params = get_peft_parameters(model, peft_method)
+    quantization_params = get_learnable_parameters_from_class(model, "BinaryMoSLinear")
+    return iter(list(peft_params) + list(quantization_params))
+
+def lwc_state_dict(model, destination=None, prefix='', keep_vars=False, quant_method="default"):
+    keys = METHOD_TO_KEYS[quant_method]
     if destination is None:
         destination = OrderedDict()
     for name, param in model.named_parameters():
-        if name.find('bound_factor') > -1:
+        if any(key in name for key in keys):
             destination[prefix + name] = param if keep_vars else param.detach()
     return destination
 
