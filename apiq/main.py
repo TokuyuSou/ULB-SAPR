@@ -330,6 +330,18 @@ def arg_parse():
         help="Learning rate for weight quantization factors",
     )
     parser.add_argument(
+        "--use_cosine_lr_scheduler",
+        default=False,
+        action="store_true",
+        help="Use cosine learning rate scheduler for all trainable parameters",
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.03,
+        help="Warmup ratio for cosine learning rate scheduler",
+    )
+    parser.add_argument(
         "--peft_lr",
         type=float,
         default=0.0005,

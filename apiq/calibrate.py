@@ -5,6 +5,7 @@ import math
 import copy
 import torch
 import torch.nn as nn
+from utils import get_cosine_schedule_with_warmup
 import numpy as np
 
 from apiq.utils import (
@@ -39,22 +40,28 @@ def calibrate(model, args, dataloader, logging=None):
     model.config.use_cache = False
 
     is_llama = False
-    if ("llama" in args.model_family) or ("mistral" in  args.model_family):
+    if ("llama" in args.model_family) or ("mistral" in args.model_family):
         is_llama = True
         layers = model.base_model.model.model.layers
-        model.base_model.model.model.embed_tokens = model.base_model.model.model.embed_tokens.to(args.device)
-        model.base_model.model.model.norm = model.base_model.model.model.norm.to(args.device)
+        model.base_model.model.model.embed_tokens = (
+            model.base_model.model.model.embed_tokens.to(args.device)
+        )
+        model.base_model.model.model.norm = model.base_model.model.model.norm.to(
+            args.device
+        )
     else:
         raise ValueError("Only support llama/mistral now")
-    
+
     layers[0] = layers[0].to(args.device)
     dtype = torch.float16
     traincast = torch.cuda.amp.autocast
     inps = torch.zeros(
-        (args.nsamples, args.seqlen, model.config.hidden_size), dtype=dtype, device=args.device
+        (args.nsamples, args.seqlen, model.config.hidden_size),
+        dtype=dtype,
+        device=args.device,
     )
     cache = {"i": 0}
-    
+
     # catch the first layer input
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -87,7 +94,9 @@ def calibrate(model, args, dataloader, logging=None):
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
     if "llama" in args.model_family or "mistral" in args.model_family:
-        model.base_model.model.model.embed_tokens = model.base_model.model.model.embed_tokens.cpu()
+        model.base_model.model.model.embed_tokens = (
+            model.base_model.model.model.embed_tokens.cpu()
+        )
         model.base_model.model.model.norm = model.base_model.model.model.norm.cpu()
     else:
         raise ValueError("Only support llama/mistral now")
@@ -95,9 +104,11 @@ def calibrate(model, args, dataloader, logging=None):
 
     # same input for the first layer of fp model and quant model
     quant_inps = inps
-    fp_inps = copy.deepcopy(inps)   # take output of fp model as input
-    fp_inps_2 = copy.deepcopy(inps) if args.aug_loss else None # qlayer and layer use the same quant_inps
-    
+    fp_inps = copy.deepcopy(inps)  # take output of fp model as input
+    fp_inps_2 = (
+        copy.deepcopy(inps) if args.aug_loss else None
+    )  # qlayer and layer use the same quant_inps
+
     attention_mask = cache["attention_mask"]
     if attention_mask is not None:
         attention_mask_batch = attention_mask.repeat(args.batch_size, 1, 1, 1).float()
@@ -111,7 +122,7 @@ def calibrate(model, args, dataloader, logging=None):
     loss_func = torch.nn.MSELoss()
 
     # Regularization term if needed
-    lambda_reg = args.lambda_reg if hasattr(args, 'lambda_reg') else 0
+    lambda_reg = args.lambda_reg if hasattr(args, "lambda_reg") else 0
 
     if is_llama:
         position_ids = cache["position_ids"]
@@ -140,17 +151,17 @@ def calibrate(model, args, dataloader, logging=None):
                 with torch.cuda.amp.autocast():
                     for j in range(args.nsamples):
                         fp_inps[j] = qlayer(
-                            fp_inps[j].unsqueeze(0), 
+                            fp_inps[j].unsqueeze(0),
                             attention_mask=attention_mask,
                             position_ids=position_ids,
-                            position_embeddings=position_embeddings
+                            position_embeddings=position_embeddings,
                         )[0]
                         if args.aug_loss:
                             fp_inps_2[j] = qlayer(
-                                quant_inps[j].unsqueeze(0), 
+                                quant_inps[j].unsqueeze(0),
                                 attention_mask=attention_mask,
                                 position_ids=position_ids,
-                                position_embeddings=position_embeddings
+                                position_embeddings=position_embeddings,
                             )[0]
 
         if args.resume:
@@ -164,11 +175,12 @@ def calibrate(model, args, dataloader, logging=None):
                 if param.requires_grad:
                     initial_params[name] = param.detach().clone()
         elif args.regularization_target == "quantization_params":
-            quantization_params = list(get_quantization_parameters(qlayer, args.quant_method, name=True))
+            quantization_params = list(
+                get_quantization_parameters(qlayer, args.quant_method, name=True)
+            )
             for name, param in qlayer.named_parameters():
                 if param.requires_grad and name in quantization_params:
                     initial_params[name] = param.detach().clone()
-                
 
         if args.epochs > 0:
             with torch.no_grad():
@@ -189,27 +201,41 @@ def calibrate(model, args, dataloader, logging=None):
                 peft_params,
                 quantization_params
             ])
+
+
+            if args.use_cosine_lr_scheduler:
+                # Make a dedicated Cosine LR scheduler for quantization parameters
+                num_training_steps = args.epochs * args.nsamples // args.batch_size
+                num_warmup_steps = int(args.warmup_ratio * num_training_steps)
+                lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer, num_warmup_steps, num_training_steps
+                )
+
             loss_scaler = NativeScalerWithGradNormCount()
 
             for epoch in range(args.epochs):
                 loss_list = []
                 norm_list = []
-                for j in range(args.nsamples // args.batch_size):    
+                for j in range(args.nsamples // args.batch_size):
                     index = j * args.batch_size
                     with traincast():
                         set_quant_state(qlayer, weight_quant=True)
                         if args.quant_method in ["default", "DB-LLM"]:
                             quant_temporary(qlayer)
                         quant_out = qlayer(
-                            quant_inps[index:index+args.batch_size,], 
+                            quant_inps[index : index + args.batch_size,],
                             attention_mask=attention_mask_batch,
                             position_ids=position_ids,
-                            position_embeddings=position_embeddings
+                            position_embeddings=position_embeddings,
                         )[0]
-                        loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
+                        loss = loss_func(
+                            fp_inps[index : index + args.batch_size,], quant_out
+                        )
                         if args.aug_loss:
-                            loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
-                    
+                            loss += loss_func(
+                                fp_inps_2[index : index + args.batch_size,], quant_out
+                            )
+
                     # Add regularization term
                     reg_loss = 0
                     if lambda_reg > 0:
@@ -235,10 +261,16 @@ def calibrate(model, args, dataloader, logging=None):
                     ).cpu()
                     norm_list.append(norm.data)
 
+                    # Update learning rate if using a scheduler
+                    if args.use_cosine_lr_scheduler:
+                        lr_scheduler.step()
+
                 loss_mean = torch.stack(loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()
-                logging.info(f"layer {i} epoch {epoch} \t|| loss: {loss_mean}\t"
-                             f"norm: {norm_mean}\tmax memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}")
+                logging.info(
+                    f"layer {i} epoch {epoch} \t|| loss: {loss_mean}\t"
+                    f"norm: {norm_mean}\tmax memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
+                )
             clear_temp_variable(qlayer)
             del optimizer
 
@@ -246,16 +278,16 @@ def calibrate(model, args, dataloader, logging=None):
         if args.quant_method in ["default", "DB-LLM"]:
             quant_inplace(qlayer)
 
-        if args.epochs>0:
+        if args.epochs > 0:
             # update input of quantization model
             with torch.no_grad():
                 with traincast():
                     for j in range(args.nsamples):
                         quant_inps[j] = qlayer(
-                            quant_inps[j].unsqueeze(0), 
-                            attention_mask=attention_mask, 
+                            quant_inps[j].unsqueeze(0),
+                            attention_mask=attention_mask,
                             position_ids=position_ids,
-                            position_embeddings=position_embeddings
+                            position_embeddings=position_embeddings,
                         )[0]
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
@@ -268,7 +300,7 @@ def calibrate(model, args, dataloader, logging=None):
             layers[i] = qlayer.to("cpu")
 
         if args.real_quant or args.convert_to_gptq:
-            assert args.wbits in [2,3,4], "Only support weight quantization in 2/3/4"
+            assert args.wbits in [2, 3, 4], "Only support weight quantization in 2/3/4"
             named_linears = get_named_linears(qlayer)
             for name, module in named_linears.items():
                 scales = module.weight_quantizer.scales
@@ -279,16 +311,24 @@ def calibrate(model, args, dataloader, logging=None):
                 zeros = zeros.view(dim0, -1)
                 if args.wbits == 3:
                     q_linear = qlinear_cuda.QuantLinear(
-                        args.wbits, group_size, module.in_features, module.out_features, not module.bias is None
+                        args.wbits,
+                        group_size,
+                        module.in_features,
+                        module.out_features,
+                        not module.bias is None,
                     )
                 else:
                     q_linear = qlinear_triton.QuantLinear(
-                        args.wbits, group_size, module.in_features,module.out_features,not module.bias is None
-                )
-                q_linear.pack(module.cpu(),  scales.float().cpu(), zeros.float().cpu())
-                add_new_module(name, qlayer, q_linear)     
+                        args.wbits,
+                        group_size,
+                        module.in_features,
+                        module.out_features,
+                        not module.bias is None,
+                    )
+                q_linear.pack(module.cpu(), scales.float().cpu(), zeros.float().cpu())
+                add_new_module(name, qlayer, q_linear)
                 print(f"pack quantized {name} finished")
-                del module  
+                del module
 
         del layer
         torch.cuda.empty_cache()
@@ -298,7 +338,7 @@ def calibrate(model, args, dataloader, logging=None):
     del fp_inps
     del fp_inps_2
     torch.cuda.empty_cache()
-    gc.collect()                    
+    gc.collect()
     model.config.use_cache = use_cache
 
     logging.info(model)
