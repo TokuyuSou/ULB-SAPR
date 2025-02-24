@@ -164,7 +164,7 @@ class FlexibleDualBinarizer(nn.Module):
             mid = 0.5 * (alpha1_val + alpha2_val)
 
             w1_b = binarize_ste(weight - mid)
-            w2_b = binarize_ste(-(weight - alpha1_val * w1_b) - 0.5 * alpha2_val)
+            w2_b = binarize_ste(-(weight - alpha1_val * w1_b - 0.5 * alpha2_val))
 
             w_approx = alpha1_val * w1_b + alpha2_val * w2_b
 
