@@ -1,9 +1,11 @@
 from math import inf
 from collections import OrderedDict
+from typing import Literal
 import torch
 from torch import nn
 from apiq.quant_linear import BaseQuantLinear, QuantLinear, BinaryMoSLinear
 import math
+from peft.tuners.lora.layer import Linear
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
@@ -12,6 +14,12 @@ from torch.optim.lr_scheduler import LambdaLR
 METHOD_TO_KEYS = {
     "default": ["bound_factor"],
     "DB-LLM": ["alpha"],
+}
+
+METHOD_TO_CLASS = {
+    "default": QuantLinear,
+    "BinaryMoS": BinaryMoSLinear,
+    "DB-LLM": QuantLinear,
 }
 
 def get_learnable_parameters_from_class(module: nn.Module, class_name: str, name: bool = False):
@@ -39,6 +47,61 @@ def get_learnable_parameters_from_class(module: nn.Module, class_name: str, name
                     p for p in submodule.parameters() if p.requires_grad
                 )
     return iter(learnable_params)
+
+def calculate_regularization_term(
+    qlayer,
+    lambda_reg=1.0,
+    reg_method: Literal["before_lora", "after_lora"] = "before_lora",
+):
+    """
+    Compute the regularization term for LoRA.
+    This considers both alpha and scaling in LoRA, ensuring that the post-quantization weights
+    and LoRA adjustments are closer to the original weights.
+
+    Args:
+        qlayer (nn.Module): A model layer that contains LoRA modules.
+        lambda_reg (float): The weight of the regularization term.
+        reg_method (str): The method to apply regularization. Options are "before_lora" and "after_lora".
+            "before_lora": Use difference between original weights and quantized weights for regularization.
+            "after_lora": Use difference between original weights and effective weights (quantized + LoRA) for regularization.
+
+    Returns:
+        torch.Tensor: The value of the regularization loss.
+    """
+    reg_loss = 0.0
+
+    # Traverse all submodules in qlayer
+    for name, sub_module in qlayer.named_modules():
+        # Look for LoRA layers
+        if isinstance(sub_module, Linear):
+            base_layer = sub_module.base_layer  # The underlying QuantLinear layer
+
+            # Retrieve the original weights (pre-quantization) and post-quantization weights
+            W_orig = base_layer.weight  # Original weights (pre-quantization)
+            W_quant = base_layer.temp_weight  # Post-quantization weights
+
+            if reg_method == "before_lora":
+                W_eff = W_quant
+            elif reg_method == "after_lora":
+                # Compute the LoRA adjustment weights
+                offsets = torch.zeros_like(W_orig)
+                for (
+                    key
+                ) in sub_module.lora_A.keys():  # Iterate through multiple LoRA keys
+                    A = sub_module.lora_A[key].weight  # LoRA matrix A
+                    B = sub_module.lora_B[key].weight  # LoRA matrix B
+                    scaling = sub_module.scaling[key]  # Scaling factor (= alpha / r)
+
+                    # Apply scaling
+                    offsets += scaling * (B @ A)
+
+                # Effective weights (post-quantization + LoRA adjustment)
+                W_eff = W_quant + offsets
+
+            # Compute the regularization term
+            reg_loss += (W_eff - W_orig).pow(2).sum()
+
+    return lambda_reg * reg_loss
 
 
 def quant_temporary(model):

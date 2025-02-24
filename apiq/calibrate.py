@@ -25,6 +25,7 @@ from apiq.utils import (
     quant_temporary,
     get_learnable_parameters_from_class,
     get_all_learnable_parameters,
+    calculate_regularization_term,
 )
 
 try:
@@ -169,18 +170,19 @@ def calibrate(model, args, dataloader, logging=None):
             qlayer.load_state_dict(peft_parameters[i], strict=False)
 
         # Save initial quantization parameters
-        initial_params = {}
-        if args.regularization_target == "all":
-            for name, param in qlayer.named_parameters():
-                if param.requires_grad:
-                    initial_params[name] = param.detach().clone()
-        elif args.regularization_target == "quantization_params":
-            quantization_params = list(
-                get_quantization_parameters(qlayer, args.quant_method, name=True)
-            )
-            for name, param in qlayer.named_parameters():
-                if param.requires_grad and name in quantization_params:
-                    initial_params[name] = param.detach().clone()
+        # (Legacy) This is used for the old regularization method
+        # initial_params = {}
+        # if args.regularization_target == "all":
+        #     for name, param in qlayer.named_parameters():
+        #         if param.requires_grad:
+        #             initial_params[name] = param.detach().clone()
+        # elif args.regularization_target == "quantization_params":
+        #     quantization_params = list(
+        #         get_quantization_parameters(qlayer, args.quant_method, name=True)
+        #     )
+        #     for name, param in qlayer.named_parameters():
+        #         if param.requires_grad and name in quantization_params:
+        #             initial_params[name] = param.detach().clone()
 
         if args.epochs > 0:
             with torch.no_grad():
@@ -238,11 +240,17 @@ def calibrate(model, args, dataloader, logging=None):
 
                     # Add regularization term
                     reg_loss = 0
+                    ## (Legacy) This is used for the old regularization method
+                    # if lambda_reg > 0:
+                    #     for name, param in qlayer.named_parameters():
+                    #         if param.requires_grad and name in initial_params:
+                    #             reg_loss += (param - initial_params[name]).pow(2).sum()
+                    #     reg_loss = lambda_reg * reg_loss
                     if lambda_reg > 0:
-                        for name, param in qlayer.named_parameters():
-                            if param.requires_grad and name in initial_params:
-                                reg_loss += (param - initial_params[name]).pow(2).sum()
-                        reg_loss = lambda_reg * reg_loss
+                        if args.quant_method not in ["default", "DB-LLM"]:
+                            raise ValueError("Regularization only supports default and DB-LLM now")
+                        reg_loss = calculate_regularization_term(qlayer, lambda_reg, args.reg_method)
+                            
 
                     total_loss = loss + reg_loss
 

@@ -269,17 +269,24 @@ def arg_parse():
     parser.add_argument(
         "--quant_method", type=str, default="default", choices=["default", "BinaryMoS", "DB-LLM"]
     )
-    # For DB-LLM
+    # Regularization
     parser.add_argument(
         "--lambda_reg", type=float, default=0.0, help="Regularization parameter"
     )
     parser.add_argument(
-        "--regularization_target",
+        "--reg_method",
         type=str,
-        default="all",
-        choices=["all", "quantization_params"],
-        help="Parameters to apply regularization",
+        default="before_lora",
+        choices=["before_lora", "after_lora"],
+        help="Regularization method",
     )
+    # parser.add_argument(
+    #     "--regularization_target",
+    #     type=str,
+    #     default="all",
+    #     choices=["all", "quantization_params"],
+    #     help="Parameters to apply regularization",
+    # )
     parser.add_argument(
         "--lwc",
         default=False,
