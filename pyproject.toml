@@ -13,19 +13,20 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    "datasets>=2.0.0","einops","jsonlines","numexpr",
-    "openai>=0.6.4","omegaconf>=2.2","peft>=0.11.1",
+    "datasets==2.21.0","einops","jsonlines","numexpr",
+    "openai>=0.6.4","omegaconf>=2.2","peft==0.12.0",
     "pybind11>=2.6.2","pycountry","pytablewriter",
     "rouge-score>=0.0.4","sacrebleu==1.5.0",
     "scikit-learn>=0.24.1","sqlitedict",
     "tqdm-multiprocess","zstandard",
-    "accelerate", "sentencepiece", "tokenizers>=0.12.1",
-    "torch>=2.0.0", "torchvision", 
-    "transformers>=4.31.0",
-    "evaluate>=0.4.2",
+    "accelerate==0.33.0", "sentencepiece", "tokenizers>=0.12.1",
+    "torch==2.5.0", "torchvision", 
+    "transformers==4.44.0",
+    "evaluate==0.4.2",
     "texttable",
     "toml", "attributedict",
-    "protobuf"
+    "protobuf",
+    "lm_eval==0.4.7"
 ]
 
 [tool.setuptools.packages.find]
