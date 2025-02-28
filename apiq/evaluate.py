@@ -7,7 +7,8 @@ from apiq.data_utils import get_loaders
 @torch.no_grad()
 def evaluate(model, tokenizer, args, logging):
     logging.info("=== start evaluation ===")
-    results = {}
+    ppl_results = {}
+    eval_results = {}
     if "llama" in args.model_family or "mistral" in args.model_family:
         model = model.to(args.device)
     else:
@@ -62,6 +63,26 @@ def evaluate(model, tokenizer, args, logging):
             ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * args.seqlen))
             logging.info(f'{dataset} : {ppl.item()}')
             model.config.use_cache = use_cache
-            results[dataset] = ppl.item()
-
-    return results
+            ppl_results[dataset] = ppl.item()
+    
+    if args.eval_tasks != "":
+        import lm_eval
+        from lm_eval.models.huggingface import HFLM
+        from lm_eval.utils import make_table
+        task_list = args.eval_tasks
+        logging.info(f"evaluating on {task_list}")
+        model = HFLM(pretrained=model, batch_size=args.eval_batch_size)
+        task_manager = lm_eval.tasks.TaskManager()
+        eval_results = lm_eval.simple_evaluate(
+        model=model,
+        tasks=task_list,
+        num_fewshot=0,
+        task_manager=task_manager,
+        )
+        logging.info(make_table(eval_results))
+        total_acc = 0
+        for task in task_list:
+            logging.info(f'{task} : {eval_results["results"][task]["acc,none"]*100:.2f}%')
+            total_acc += eval_results['results'][task]['acc,none']
+        logging.info(f'Average Acc: {total_acc/len(task_list)*100:.2f}%')
+    return ppl_results, eval_results
