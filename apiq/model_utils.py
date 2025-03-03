@@ -1,3 +1,11 @@
+import os
+import torch
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
+from squeezellm.model_parse import get_module_names, get_sequential
+
 from apiq.quant_linear import QuantLinear, BinaryMoSLinear
 from torch import nn
 from peft.peft_model import PeftModelForCausalLM
@@ -113,3 +121,33 @@ def replace_modules(
             setattr(father, name[ind + 1 :], mos_linear)
             if print_layers:
                 print(f"replace layer {name} with {mos_linear}")
+
+
+def load_layer_gradients(
+    gradient_dir: str, layer_idx: int, model_type: str, logging=None, device="cuda"
+):
+    """
+    Load gradient chunk for the i-th layer, returning a dict of
+    {param_name: gradient_tensor}.
+    param_name must match the real parameter name in qlayer.
+    """
+    grad_file = os.path.join(gradient_dir, f"layer_{layer_idx}.pt")
+    if not os.path.exists(grad_file):
+        if logging is not None:
+            logging.warning(f"Gradient file not found: {grad_file}")
+        return {}
+
+    # Read gradient file for each layer {"q": Tensor, "k": Tensor, ...}
+    chunk_data = torch.load(grad_file, map_location=device)
+
+    # Get the mapping from short keys in chunk_data to full keys in the model
+    module_names = get_module_names(model_type)  # e.g. ["q", "k", "v", ...]
+    seq_names = get_sequential(model_type)  # e.g. ["self_attn.q_proj", ...]
+
+    layer_grad_dict = {}
+    for short_key, full_key in zip(module_names, seq_names):
+        param_key = full_key
+        if short_key in chunk_data:
+            layer_grad_dict[param_key] = chunk_data[short_key].clone()
+
+    return layer_grad_dict
