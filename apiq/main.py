@@ -23,10 +23,11 @@ from apiq.calibrate import calibrate
 from apiq.evaluate import evaluate
 from apiq.quant_linear import QuantLinear
 
+start_time = time.strftime('%Y-%m-%d-%H-%M-%S')
 
 logging.basicConfig(
     filename=os.path.join(
-        "/home/ubuntu/ApiQ/ApiQ/logs", f"{time.strftime('%Y-%m-%d-%H-%M-%S')}_apiq.log"
+        "/home/ubuntu/ApiQ/ApiQ/logs", f"{start_time}_apiq.log"
     ),
     format="%(asctime)s %(levelname)-8s %(message)s",
     level=logging.INFO,
@@ -52,7 +53,11 @@ def main(args):
         Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
     if args.save_dir:
         # Create subfolder for each quantization method and run (based on time)
-        args.save_dir = os.path.join(args.save_dir, args.quant_method, "run_" + time.strftime('%Y-%m-%d-%H-%M-%S'))
+        args.save_dir = os.path.join(
+            args.save_dir,
+            args.quant_method,
+            "run_" + start_time,
+        )
         print(f"Save dir: {args.save_dir}")
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     if args.convert_to_gptq:
@@ -138,10 +143,12 @@ def main(args):
             zero_point_type=args.zero_point_type,
             do_train=True,
             print_layers=True,
-            freeze_original_weights=False if args.train_original_weights else True
+            freeze_original_weights=False if args.train_original_weights else True,
         )
     else:
-        model = quantize_llama_like(model, weight_quant_params, quant_method=args.quant_method)
+        model = quantize_llama_like(
+            model, weight_quant_params, quant_method=args.quant_method
+        )
     model.eval()
     logging.info(model)
 
@@ -267,11 +274,17 @@ def arg_parse():
     )
     # Quantization
     parser.add_argument(
-        "--quant_method", type=str, default="default", choices=["default", "BinaryMoS", "DB-LLM"]
+        "--quant_method",
+        type=str,
+        default="default",
+        choices=["default", "BinaryMoS", "DB-LLM"],
     )
     # Regularization
     parser.add_argument(
         "--lambda_reg", type=float, default=0.0, help="Regularization parameter"
+    )
+    parser.add_argument(
+        "--lambda_reg_multiplier", type=float, default=1.0, help="Multiplier for lambda_reg with each layer"
     )
     parser.add_argument(
         "--reg_method",
@@ -279,6 +292,18 @@ def arg_parse():
         default="before_lora",
         choices=["before_lora", "after_lora"],
         help="Regularization method",
+    )
+    parser.add_argument(
+        "--weighted_reg",
+        default=False,
+        action="store_true",
+        help="Weighted regularization based on gradients",
+    )
+    parser.add_argument(
+        "--gradient_dir",
+        type=str,
+        default=None,
+        help="Directory to load gradients for weighted regularization",
     )
     # parser.add_argument(
     #     "--regularization_target",
@@ -363,7 +388,25 @@ def arg_parse():
     parser.add_argument(
         "--peft_wd", type=float, default=0.1, help="Weight decay for PEFT parameters"
     )
+    parser.add_argument(
+        "--wpt_peft_lr", type=float, default=0.0005, help="Learning rate for PEFT parameters during weight preservation training"
+    )
+    parser.add_argument(
+        "--wpt_peft_wd", type=float, default=0.1, help="Weight decay for PEFT parameters during weight preservation training"
+    )
+    parser.add_argument(
+        "--wpt_lwc_lr", type=float, default=0.005, help="Learning rate for weight quantization factors during weight preservation training"
+    )
+    parser.add_argument(
+        "--wpt_lwc_wd", type=float, default=0.1, help="Weight decay for weight quantization factors during weight preservation training"
+    )
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--wpt_epochs",
+        type=int,
+        default=0,
+        help="Number of epochs to train using weight preservation as the target",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(
         "--aug_loss",
@@ -374,7 +417,7 @@ def arg_parse():
     # Output
     parser.add_argument(
         "--cache_dir",
-        default="./cache",
+        default="/home/ubuntu/ApiQ/cache",
         type=str,
         help="Cache dir of dataset, leading to faster debug",
     )
@@ -390,6 +433,15 @@ def arg_parse():
     )
     # Other
     parser.add_argument("--eval_ppl", default=False, action="store_true")
+
+    # List of tasks to evaluate on
+    parser.add_argument(
+        "--eval_tasks",
+        type=lambda s: s.split(","),
+        default=[],
+        help="List of tasks to evaluate on",
+    )
+    parser.add_argument("--eval_batch_size", type=int, default=16)
     parser.add_argument(
         "--limit",
         type=int,

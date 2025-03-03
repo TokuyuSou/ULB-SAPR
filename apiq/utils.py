@@ -50,8 +50,9 @@ def get_learnable_parameters_from_class(module: nn.Module, class_name: str, name
 
 def calculate_regularization_term(
     qlayer,
-    lambda_reg=1.0,
     reg_method: Literal["before_lora", "after_lora"] = "before_lora",
+    use_gradient_weighting: bool = False,
+    gradient_dict: dict[str, torch.Tensor] | None= None,
 ):
     """
     Compute the regularization term for LoRA.
@@ -64,6 +65,8 @@ def calculate_regularization_term(
         reg_method (str): The method to apply regularization. Options are "before_lora" and "after_lora".
             "before_lora": Use difference between original weights and quantized weights for regularization.
             "after_lora": Use difference between original weights and effective weights (quantized + LoRA) for regularization.
+        use_gradient_weighting (bool): If True, apply gradient weighting to the regularization term.
+        gradient_dict (dict[str, torch.Tensor]): A dictionary of gradients for each parameter.
 
     Returns:
         torch.Tensor: The value of the regularization loss.
@@ -98,10 +101,20 @@ def calculate_regularization_term(
                 # Effective weights (post-quantization + LoRA adjustment)
                 W_eff = W_quant + offsets
 
-            # Compute the regularization term
-            reg_loss += (W_eff - W_orig).pow(2).sum()
+            if use_gradient_weighting:
+                if gradient_dict is None:
+                    raise ValueError(
+                        "Gradient dictionary is required for gradient weighting."
+                    )
+                grad_squared = gradient_dict[name] # gradient dict already contains the squared gradient
+                diff_squared = (W_eff - W_orig).pow(2)
+                reg_loss += (grad_squared * diff_squared).sum()
 
-    return lambda_reg * reg_loss
+            else:
+                # Compute the regularization term
+                reg_loss += (W_eff - W_orig).pow(2).sum()
+
+    return reg_loss
 
 
 def quant_temporary(model):
