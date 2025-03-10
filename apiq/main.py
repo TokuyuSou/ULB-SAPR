@@ -22,6 +22,7 @@ from apiq.data_utils import get_loaders
 from apiq.calibrate import calibrate
 from apiq.evaluate import evaluate
 from apiq.quant_linear import QuantLinear
+from apiq.utils import TrainingConfig
 
 start_time = time.strftime('%Y-%m-%d-%H-%M-%S')
 
@@ -65,7 +66,7 @@ def main(args):
             args.resume != args.save_dir
         ), "--resume refers to the folder of fake quant."
     assert not (
-        args.epochs > 1 and args.convert_to_gptq
+        args.opt_epochs + args.wpt_epochs + args.mixedt_epochs > 1 and args.convert_to_gptq
     ), "--convert_to_gptq can only be set after calibration"
 
     # Load model and tokenizer
@@ -354,9 +355,23 @@ def arg_parse():
         help="real quantization, which can see memory reduce. Note that due to the limitations of AutoGPTQ kernels, "
         "the real quantization of weight-only quantization can only lead memory reduction, but with slower inference speed.",
     )
-    # Training
+    ## Training
     parser.add_argument(
-        "--lwc_lr",
+        "--train_order",
+        nargs="+",
+        default=["wpt", "mixed", "opt"],
+        help="Order of training stages with different targets",
+    )
+    
+    # Configuration for output-preservation training
+    parser.add_argument(
+        "--opt_epochs",
+        type=int,
+        default=20,
+        help="Number of epochs to train the model using output preservation as the target",
+    )
+    parser.add_argument(
+        "--opt_lwc_lr",
         type=float,
         default=0.005,
         help="Learning rate for weight quantization factors",
@@ -374,19 +389,27 @@ def arg_parse():
         help="Warmup ratio for cosine learning rate scheduler",
     )
     parser.add_argument(
-        "--peft_lr",
+        "--opt_peft_lr",
         type=float,
         default=0.0005,
         help="Learning rate for PEFT parameters",
     )
     parser.add_argument(
-        "--lwc_wd",
+        "--opt_lwc_wd",
         type=float,
         default=0.1,
         help="Weight decay for weight quantization factors",
     )
     parser.add_argument(
-        "--peft_wd", type=float, default=0.1, help="Weight decay for PEFT parameters"
+        "--opt_peft_wd", type=float, default=0.1, help="Weight decay for PEFT parameters"
+    )
+    
+    # Configuration for weight-preservation training
+    parser.add_argument(
+        "--wpt_epochs",
+        type=int,
+        default=0,
+        help="Number of epochs to train using weight preservation as the target",
     )
     parser.add_argument(
         "--wpt_peft_lr", type=float, default=0.0005, help="Learning rate for PEFT parameters during weight preservation training"
@@ -400,13 +423,29 @@ def arg_parse():
     parser.add_argument(
         "--wpt_lwc_wd", type=float, default=0.1, help="Weight decay for weight quantization factors during weight preservation training"
     )
-    parser.add_argument("--epochs", type=int, default=20)
+    
+    # Configuration for mixed training
     parser.add_argument(
-        "--wpt_epochs",
+        "--mixedt_epochs",
         type=int,
         default=0,
-        help="Number of epochs to train using weight preservation as the target",
+        help="Number of epochs to train using the sum of weight and output preservation as the target",
     )
+    parser.add_argument(
+        "--mixedt_peft_lr", type=float, default=0.0005, help="Learning rate for PEFT parameters during mixed training"
+    )
+    parser.add_argument(
+        "--mixedt_peft_wd", type=float, default=0.1, help="Weight decay for PEFT parameters during mixed training"
+    )
+    parser.add_argument(
+        "--mixedt_lwc_lr", type=float, default=0.005, help="Learning rate for weight quantization factors during mixed training"
+    )
+    parser.add_argument(
+        "--mixedt_lwc_wd", type=float, default=0.1, help="Weight decay for weight quantization factors during mixed training"
+    )
+    
+        
+
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(
         "--aug_loss",
@@ -450,6 +489,34 @@ def arg_parse():
     )
 
     args = parser.parse_args()
+    
+    wpt_training_config = TrainingConfig(
+        epochs=args.wpt_epochs,
+        peft_lr=args.wpt_peft_lr,
+        peft_wd=args.wpt_peft_wd,
+        lwc_lr=args.wpt_lwc_lr,
+        lwc_wd=args.wpt_lwc_wd,
+    )
+    opt_training_config = TrainingConfig(
+        epochs=args.opt_epochs,
+        peft_lr=args.opt_peft_lr,
+        peft_wd=args.opt_peft_wd,
+        lwc_lr=args.opt_lwc_lr,
+        lwc_wd=args.opt_lwc_wd,
+    )
+    mixedt_training_config = TrainingConfig(
+        epochs=args.mixedt_epochs,
+        peft_lr=args.mixedt_peft_lr,
+        peft_wd=args.mixedt_peft_wd,
+        lwc_lr=args.mixedt_lwc_lr,
+        lwc_wd=args.mixedt_lwc_wd,
+    )
+    
+    args.training_configs = {
+        "wpt": wpt_training_config,
+        "opt": opt_training_config,
+        "mixedt": mixedt_training_config,
+    }
     return args
 
 
