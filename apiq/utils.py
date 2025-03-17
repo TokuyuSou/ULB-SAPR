@@ -1,6 +1,6 @@
 from math import inf
 from collections import OrderedDict
-from typing import Literal
+from typing import Literal, TypedDict
 import torch
 from torch import nn
 from apiq.quant_linear import BaseQuantLinear, QuantLinear, BinaryMoSLinear
@@ -357,3 +357,36 @@ def get_cosine_schedule_with_warmup(
         return max(0.0, cosine_lr_multiple)
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+class TrainingConfig(TypedDict):
+    epochs: int
+    peft_lr: float
+    peft_wd: float
+    lwc_lr: float
+    lwc_wd: float
+
+TRAINING_STAGES = {
+    "wpt": "Weight Preservation Training",
+    "opt": "Output Preservation Training",
+    "mixedt": "Weight and Output Preservation Training",
+}
+
+
+def get_coefficients(
+    train_stage: Literal["wpt", "opt", "mixedt"], lambda_reg: float
+) -> tuple[float, float]:
+    """Get coefficients for the loss and regularization terms based on the training stage
+
+    Args:
+        train_stage (Literal["wpt", "opt", "mixedt"]): training stage
+        lambda_reg (float): regularization coefficient (hyperparameter)
+
+    Returns:
+        Tuple[float, float]: coefficients for the loss and regularization
+    """
+    if train_stage == "wpt":
+        return 0.0, lambda_reg  # This can be any value as there is only one term
+    elif train_stage == "opt":
+        return 1.0, 0.0
+    elif train_stage == "mixedt":
+        return 1.0, lambda_reg

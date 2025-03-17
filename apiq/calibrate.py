@@ -26,6 +26,8 @@ from apiq.utils import (
     get_all_learnable_parameters,
     calculate_regularization_term,
     get_cosine_schedule_with_warmup,
+    TRAINING_STAGES,
+    get_coefficients,
 )
 
 from apiq.model_utils import load_layer_gradients
@@ -147,17 +149,23 @@ def calibrate(model, args, dataloader, logging=None):
             # Load gradients when using them for weighted regularization
             if args.gradient_dir is not None:
                 layer_gradient_dict = load_layer_gradients(
-                    args.gradient_dir, i, args.model_family, logging=logging, device=args.device
+                    args.gradient_dir,
+                    i,
+                    args.model_family,
+                    logging=logging,
+                    device=args.device,
                 )
             else:
-                raise ValueError("Gradient directory is required for weighted regularization")
+                raise ValueError(
+                    "Gradient directory is required for weighted regularization"
+                )
         layer = layers[i].to(args.device)
         qlayer = copy.deepcopy(layer)
         qlayer = qlayer.to(args.device)
 
         # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False)
-        if args.epochs + args.wpt_epochs > 0:
+        if args.opt_epochs + args.mixedt_epochs > 0:
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
                     for j in range(args.nsamples):
@@ -195,11 +203,11 @@ def calibrate(model, args, dataloader, logging=None):
         #             initial_params[name] = param.detach().clone()
 
         # Get lambda_reg
-        lambda_reg = args.lambda_reg * (args.lambda_reg_multiplier ** i)
-        lambda_loss = 1.0 # coefficient for loss term
+        original_lambda_reg = args.lambda_reg * (args.lambda_reg_multiplier**i)
 
-        if args.epochs + args.wpt_epochs > 0:
-            ## (Note) First train using weight preservation objective for args.wpt_epochs epochs, and then train using output preservation objective for args.epochs epochs
+        if args.opt_epochs + args.wpt_epochs + args.mixedt_epochs > 0:
+            ## Training is split into three stages: weight preservation, output preservation, and mixed training
+            training_stages = args.train_order
             with torch.no_grad():
                 qlayer.float()  # required for AMP training
             # create optimizer
@@ -214,14 +222,11 @@ def calibrate(model, args, dataloader, logging=None):
                 "weight_decay": args.wpt_lwc_wd,
             }
 
-            optimizer = torch.optim.AdamW([
-                peft_params,
-                quantization_params
-            ])
+            optimizer = torch.optim.AdamW([peft_params, quantization_params])
 
             if args.use_cosine_lr_scheduler:
-                # Make a dedicated Cosine LR scheduler for quantization parameters
-                num_training_steps = args.epochs * args.nsamples // args.batch_size
+                # Make a dedicated Cosine LR scheduler for quantization parameters (only used in the output preservation stage)
+                num_training_steps = args.opt_epochs * args.nsamples // args.batch_size
                 num_warmup_steps = int(args.warmup_ratio * num_training_steps)
                 lr_scheduler = get_cosine_schedule_with_warmup(
                     optimizer, num_warmup_steps, num_training_steps
@@ -229,27 +234,83 @@ def calibrate(model, args, dataloader, logging=None):
 
             loss_scaler = NativeScalerWithGradNormCount()
 
-            for epoch in range(args.epochs + args.wpt_epochs):
-                if epoch == args.wpt_epochs:
-                    # Switch from weight preservation to output preservation
-                    logging.info("Switching from weight preservation to output preservation")
-                    optimizer.param_groups[0]["lr"] = args.peft_lr
-                    optimizer.param_groups[0]["weight_decay"] = args.peft_wd
-                    optimizer.param_groups[1]["lr"] = args.lwc_lr
-                    optimizer.param_groups[1]["weight_decay"] = args.lwc_wd
+            for epoch in range(args.opt_epochs + args.wpt_epochs + args.mixedt_epochs):
+                if epoch == 0:
+                    # Start the first training stage
+                    stage = training_stages[0]
+                    if stage not in TRAINING_STAGES:
+                        raise ValueError(f"Invalid training stage: {stage}")
+                    logging.info(f"Starting {TRAINING_STAGES[stage]} training")
+                    optimizer.param_groups[0]["lr"] = args.training_configs[stage][
+                        "peft_lr"
+                    ]
+                    optimizer.param_groups[0]["weight_decay"] = args.training_configs[
+                        stage
+                    ]["peft_wd"]
+                    optimizer.param_groups[1]["lr"] = args.training_configs[stage][
+                        "lwc_lr"
+                    ]
+                    optimizer.param_groups[1]["weight_decay"] = args.training_configs[
+                        stage
+                    ]["lwc_wd"]
 
-                # Uncomment this if you don't use the output preservation objective while doing weight preservation training
-                # Set correct coefficient for regularization term
-                # if epoch < args.wpt_epochs:
-                #     lambda_loss = 0
-                # else:
-                #     lambda_loss = 1.0
-                #     lambda_reg = 0
+                    lambda_loss, lambda_reg = get_coefficients(
+                        train_stage=stage, lambda_reg=original_lambda_reg
+                    )
 
-                if epoch < args.wpt_epochs:
-                    pass
-                else:
-                    lambda_reg = 0
+                if epoch == args.training_configs[training_stages[0]]["epochs"]:
+                    # Switch to the next training stage
+                    stage = training_stages[1]
+                    if stage not in TRAINING_STAGES:
+                        raise ValueError(f"Invalid training stage: {stage}")
+                    logging.info(
+                        f"Switching from {TRAINING_STAGES[training_stages[0]]} to {TRAINING_STAGES[stage]} training"
+                    )
+                    optimizer.param_groups[0]["lr"] = args.training_configs[stage][
+                        "peft_lr"
+                    ]
+                    optimizer.param_groups[0]["weight_decay"] = args.training_configs[
+                        stage
+                    ]["peft_wd"]
+                    optimizer.param_groups[1]["lr"] = args.training_configs[stage][
+                        "lwc_lr"
+                    ]
+                    optimizer.param_groups[1]["weight_decay"] = args.training_configs[
+                        stage
+                    ]["lwc_wd"]
+
+                    lambda_loss, lambda_reg = get_coefficients(
+                        train_stage=stage, lambda_reg=original_lambda_reg
+                    )
+
+                if (
+                    epoch
+                    == args.training_configs[training_stages[0]]["epochs"]
+                    + args.training_configs[training_stages[1]]["epochs"]
+                ):
+                    # Switch to the next training stage
+                    stage = training_stages[2]
+                    if stage not in TRAINING_STAGES:
+                        raise ValueError(f"Invalid training stage: {stage}")
+                    logging.info(
+                        f"Switching from {TRAINING_STAGES[training_stages[1]]} to {TRAINING_STAGES[stage]} training"
+                    )
+                    optimizer.param_groups[0]["lr"] = args.training_configs[stage][
+                        "peft_lr"
+                    ]
+                    optimizer.param_groups[0]["weight_decay"] = args.training_configs[
+                        stage
+                    ]["peft_wd"]
+                    optimizer.param_groups[1]["lr"] = args.training_configs[stage][
+                        "lwc_lr"
+                    ]
+                    optimizer.param_groups[1]["weight_decay"] = args.training_configs[
+                        stage
+                    ]["lwc_wd"]
+
+                    lambda_loss, lambda_reg = get_coefficients(
+                        train_stage=stage, lambda_reg=original_lambda_reg
+                    )
 
                 loss_list = []
                 reg_loss_list = []
@@ -273,7 +334,8 @@ def calibrate(model, args, dataloader, logging=None):
                             )
                             if args.aug_loss:
                                 loss += loss_func(
-                                    fp_inps_2[index : index + args.batch_size,], quant_out
+                                    fp_inps_2[index : index + args.batch_size,],
+                                    quant_out,
                                 )
                             loss = lambda_loss * loss
 
@@ -287,7 +349,9 @@ def calibrate(model, args, dataloader, logging=None):
                     #     reg_loss = lambda_reg * reg_loss
                     if lambda_reg > 0:
                         if args.quant_method not in ["default", "DB-LLM"]:
-                            raise ValueError("Regularization only supports default and DB-LLM now")
+                            raise ValueError(
+                                "Regularization only supports default and DB-LLM now"
+                            )
                         if args.weighted_reg:
                             # Weighted regularization term
                             reg_loss = calculate_regularization_term(
@@ -346,7 +410,9 @@ def calibrate(model, args, dataloader, logging=None):
                         f"norm: {norm_mean}\tmax memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
                     )
                 else:
-                    raise ValueError("Both lambda_loss and lambda_reg are 0. Nothing is being trained.")
+                    raise ValueError(
+                        "Both lambda_loss and lambda_reg are 0. Nothing is being trained."
+                    )
             clear_temp_variable(qlayer)
             del optimizer
 
@@ -354,7 +420,7 @@ def calibrate(model, args, dataloader, logging=None):
         if args.quant_method in ["default", "DB-LLM"]:
             quant_inplace(qlayer)
 
-        if args.epochs + args.wpt_epochs > 0:
+        if args.opt_epochs + args.wpt_epochs + args.mixedt_epochs > 0:
             # update input of quantization model
             with torch.no_grad():
                 with traincast():
@@ -367,7 +433,7 @@ def calibrate(model, args, dataloader, logging=None):
                         )[0]
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
-            lwc_parameters[i] = lwc_state_dict(qlayer, quant_method = args.quant_method)
+            lwc_parameters[i] = lwc_state_dict(qlayer, quant_method=args.quant_method)
             peft_parameters[i] = peft_state_dict(qlayer, args.peft_method)
             torch.save(lwc_parameters, os.path.join(args.save_dir, f"lwc.pth"))
             torch.save(peft_parameters, os.path.join(args.save_dir, f"peft.pth"))
