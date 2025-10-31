@@ -368,7 +368,7 @@ def arg_parse():
     parser.add_argument(
         "--opt_epochs",
         type=int,
-        default=20,
+        default=0,
         help="Number of epochs to train the model using output preservation as the target",
     )
     parser.add_argument(
@@ -476,6 +476,13 @@ def arg_parse():
         default=0,
         help="Layer from which to start applying SW loss",
     )
+    parser.add_argument(
+        "--scale_sw_loss",
+        action="store_true",
+        default=False,
+        help="Whether to scale SW loss so that it has the same magnitude as MSE loss (before weighting by sw_weight)",
+    )
+    
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(

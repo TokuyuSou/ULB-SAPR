@@ -130,6 +130,7 @@ def calibrate(model, args, dataloader, logging=None):
     loss_func = torch.nn.MSELoss()
     # SW loss config
     use_sw = getattr(args, "use_sw_loss", False) and (getattr(args, "sw_weight", 0.0) > 0.0)
+    scale_sw = getattr(args, "scale_sw_loss", False)
     sw_weight = getattr(args, "sw_weight", 0.0)
     sw_n_projections = getattr(args, "sw_n_projections", 16)
     sw_block_size = getattr(args, "sw_block_size", None)
@@ -193,6 +194,69 @@ def calibrate(model, args, dataloader, logging=None):
         if args.resume:
             qlayer.load_state_dict(lwc_parameters[i], strict=False)
             qlayer.load_state_dict(peft_parameters[i], strict=False)
+            
+        # compute per-layer sw scaling factor (to match content scale)
+        sw_scale = 1.0
+        eps = 1e-6
+        
+        if use_sw and (i >= sw_start_layer) and scale_sw:
+            with torch.no_grad():
+                total_content = []
+                total_sw = []
+
+                # quantize once before loop
+                if args.quant_method in ["default", "DB-LLM"]:
+                    quant_temporary(qlayer)
+
+                for j in range(args.nsamples // args.batch_size):
+                    index = j * args.batch_size
+                    with torch.cuda.amp.autocast(enabled=False):
+                        quant_out_tmp = qlayer(
+                            quant_inps[index : index + args.batch_size,].to(args.device).float(),
+                            attention_mask=(
+                                attention_mask_batch.to(args.device).float()
+                                if attention_mask_batch is not None
+                                else None
+                            ),
+                            position_ids=position_ids,
+                        )[0].float()
+
+                    base_content = loss_func(
+                        fp_inps[index : index + args.batch_size,].to(args.device).float(),
+                        quant_out_tmp,
+                    )
+                    if args.aug_loss:
+                        base_content = base_content + loss_func(
+                            fp_inps_2[index : index + args.batch_size,].to(args.device).float(),
+                            quant_out_tmp,
+                        )
+                    base_sw = sliced_wasserstein_loss(
+                        fp_inps[index : index + args.batch_size,].to(args.device).float(),
+                        quant_out_tmp,
+                        n_projections=sw_n_projections,
+                        block_size=sw_block_size,
+                        device=args.device,
+                    )
+
+                    if torch.isfinite(base_content) and torch.isfinite(base_sw) and (base_sw.item() > 0):
+                        total_content.append(base_content.detach())
+                        total_sw.append(base_sw.detach())
+
+                # clear quantization state once after all batches
+                clear_temp_variable(qlayer)
+
+            # average scale computation
+            if len(total_content) == 0:
+                sw_scale = 1.0
+            else:
+                mean_content = torch.stack(total_content).mean()
+                mean_sw = torch.stack(total_sw).mean()
+                if (not torch.isfinite(mean_content)) or (not torch.isfinite(mean_sw)) or (mean_content.item() < 1e-8):
+                    sw_scale = 1.0
+                else:
+                    sw_scale = (mean_content / (mean_sw + eps)).item()
+                logging.info(f"Layer {i} SW loss scale factor: {sw_scale}, mean_content: {mean_content}, mean_sw: {mean_sw}")
+
 
         # Save initial quantization parameters
         # (Legacy) This is used for the old regularization method
@@ -338,29 +402,6 @@ def calibrate(model, args, dataloader, logging=None):
                                 position_ids=position_ids,
                                 # position_embeddings=position_embeddings,
                             )[0]
-                            # # Content loss: MSE (+ SW)
-                            # loss_mse = loss_func(
-                            #     fp_inps[index : index + args.batch_size,], quant_out
-                            # )
-                            # loss_mse_list.append(loss_mse.detach().cpu())
-                            # if use_sw and (i >= sw_start_layer):
-                            #     loss_sw_val = sliced_wasserstein_loss(
-                            #         fp_inps[index : index + args.batch_size,],
-                            #         quant_out,
-                            #         n_projections=sw_n_projections,
-                            #         block_size=sw_block_size,
-                            #         device=args.device,
-                            #     )
-                            #     loss_sw_list.append(loss_sw_val.detach().cpu())
-                            #     content_loss = (1.0 - sw_weight) * loss_mse + sw_weight * loss_sw_val
-                            # else:
-                            #     content_loss = loss_mse
-                            # if args.aug_loss:
-                            #     # 追加のMSEをそのまま加算（従来と同じ振る舞い）
-                            #     content_loss = content_loss + loss_func(
-                            #         fp_inps_2[index : index + args.batch_size,], quant_out
-                            #     )
-                            # loss = lambda_loss * content_loss
                             
                             loss_mse = loss_func(
                                 fp_inps[index : index + args.batch_size,], quant_out
@@ -374,13 +415,14 @@ def calibrate(model, args, dataloader, logging=None):
                                 )
 
                             if use_sw and (i >= sw_start_layer):
-                                loss_sw_val = sliced_wasserstein_loss(
+                                raw_loss_sw_val = sliced_wasserstein_loss(
                                     fp_inps[index : index + args.batch_size,],
                                     quant_out,
                                     n_projections=sw_n_projections,
                                     block_size=sw_block_size,
                                     device=args.device,
                                 )
+                                loss_sw_val = sw_scale * raw_loss_sw_val
                                 loss_sw_list.append(loss_sw_val.detach().cpu())
                                 # mix (MSE + AUG) with SW
                                 content_loss = (1.0 - sw_weight) * loss_mse + sw_weight * loss_sw_val
