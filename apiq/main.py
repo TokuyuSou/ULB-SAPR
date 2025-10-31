@@ -28,7 +28,7 @@ start_time = time.strftime('%Y-%m-%d-%H-%M-%S')
 
 logging.basicConfig(
     filename=os.path.join(
-        "/home/ubuntu/ApiQ/ApiQ/logs", f"{start_time}_apiq.log"
+        "/workspace/ULB-SAPR/logs", f"{start_time}_apiq.log"
     ),
     format="%(asctime)s %(levelname)-8s %(message)s",
     level=logging.INFO,
@@ -71,6 +71,7 @@ def main(args):
 
     # Load model and tokenizer
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {args.device}")
     config = AutoConfig.from_pretrained(
         args.model_name_or_path, attn_implementation=args.attn_implementation
     )
@@ -359,7 +360,7 @@ def arg_parse():
     parser.add_argument(
         "--train_order",
         nargs="+",
-        default=["wpt", "mixed", "opt"],
+        default=["wpt", "mixedt", "opt"],
         help="Order of training stages with different targets",
     )
     
@@ -443,8 +444,38 @@ def arg_parse():
     parser.add_argument(
         "--mixedt_lwc_wd", type=float, default=0.1, help="Weight decay for weight quantization factors during mixed training"
     )
-    
-        
+
+    # Sliced-Wasserstein loss options
+    parser.add_argument(
+        "--use_sw_loss",
+        action="store_true",
+        default=False,
+        help="Enable Sliced-Wasserstein loss term in output loss",
+    )
+    parser.add_argument(
+        "--sw_weight",
+        type=float,
+        default=0.0,
+        help="Mixture weight for SW loss with MSE (0.0 disables SW contribution)",
+    )
+    parser.add_argument(
+        "--sw_n_projections",
+        type=int,
+        default=16,
+        help="Number of random projections for Sliced-Wasserstein",
+    )
+    parser.add_argument(
+        "--sw_block_size",
+        type=int,
+        default=None,
+        help="Optional block size along sequence dimension for SW computation",
+    )
+    parser.add_argument(
+        "--sw_start_layer",
+        type=int,
+        default=0,
+        help="Layer from which to start applying SW loss",
+    )
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(

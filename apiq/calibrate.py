@@ -31,6 +31,7 @@ from apiq.utils import (
 )
 
 from apiq.model_utils import load_layer_gradients
+from apiq.sliced_wasserstein_loss import sliced_wasserstein_loss
 
 try:
     import auto_gptq.nn_modules.qlinear.qlinear_cuda as qlinear_cuda
@@ -127,6 +128,12 @@ def calibrate(model, args, dataloader, logging=None):
         attention_mask_batch = None
 
     loss_func = torch.nn.MSELoss()
+    # SW loss config
+    use_sw = getattr(args, "use_sw_loss", False) and (getattr(args, "sw_weight", 0.0) > 0.0)
+    sw_weight = getattr(args, "sw_weight", 0.0)
+    sw_n_projections = getattr(args, "sw_n_projections", 16)
+    sw_block_size = getattr(args, "sw_block_size", None)
+    sw_start_layer = getattr(args, "sw_start_layer", 0)
 
     if is_llama:
         position_ids = cache["position_ids"]
@@ -315,6 +322,8 @@ def calibrate(model, args, dataloader, logging=None):
                 loss_list = []
                 reg_loss_list = []
                 norm_list = []
+                loss_mse_list = []
+                loss_sw_list = []
                 for j in range(args.nsamples // args.batch_size):
                     # set_quant_state(qlayer, weight_quant=True) # No need to quantize again here.
                     if args.quant_method in ["default", "DB-LLM"]:
@@ -329,15 +338,57 @@ def calibrate(model, args, dataloader, logging=None):
                                 position_ids=position_ids,
                                 # position_embeddings=position_embeddings,
                             )[0]
-                            loss = loss_func(
+                            # # Content loss: MSE (+ SW)
+                            # loss_mse = loss_func(
+                            #     fp_inps[index : index + args.batch_size,], quant_out
+                            # )
+                            # loss_mse_list.append(loss_mse.detach().cpu())
+                            # if use_sw and (i >= sw_start_layer):
+                            #     loss_sw_val = sliced_wasserstein_loss(
+                            #         fp_inps[index : index + args.batch_size,],
+                            #         quant_out,
+                            #         n_projections=sw_n_projections,
+                            #         block_size=sw_block_size,
+                            #         device=args.device,
+                            #     )
+                            #     loss_sw_list.append(loss_sw_val.detach().cpu())
+                            #     content_loss = (1.0 - sw_weight) * loss_mse + sw_weight * loss_sw_val
+                            # else:
+                            #     content_loss = loss_mse
+                            # if args.aug_loss:
+                            #     # 追加のMSEをそのまま加算（従来と同じ振る舞い）
+                            #     content_loss = content_loss + loss_func(
+                            #         fp_inps_2[index : index + args.batch_size,], quant_out
+                            #     )
+                            # loss = lambda_loss * content_loss
+                            
+                            loss_mse = loss_func(
                                 fp_inps[index : index + args.batch_size,], quant_out
                             )
+                            loss_mse_list.append(loss_mse.detach().cpu())
+
+                            # add extra MSE first (if enabled)
                             if args.aug_loss:
-                                loss += loss_func(
-                                    fp_inps_2[index : index + args.batch_size,],
-                                    quant_out,
+                                loss_mse = loss_mse + loss_func(
+                                    fp_inps_2[index : index + args.batch_size,], quant_out
                                 )
-                            loss = lambda_loss * loss
+
+                            if use_sw and (i >= sw_start_layer):
+                                loss_sw_val = sliced_wasserstein_loss(
+                                    fp_inps[index : index + args.batch_size,],
+                                    quant_out,
+                                    n_projections=sw_n_projections,
+                                    block_size=sw_block_size,
+                                    device=args.device,
+                                )
+                                loss_sw_list.append(loss_sw_val.detach().cpu())
+                                # mix (MSE + AUG) with SW
+                                content_loss = (1.0 - sw_weight) * loss_mse + sw_weight * loss_sw_val
+                            else:
+                                # no SW, just (MSE + AUG)
+                                content_loss = loss_mse
+
+                            loss = lambda_loss * content_loss
 
                     # Add regularization term
                     reg_loss = 0
@@ -391,23 +442,43 @@ def calibrate(model, args, dataloader, logging=None):
                         lr_scheduler.step()
                 if lambda_loss > 0:
                     loss_mean = torch.stack(loss_list).mean()
+                    loss_mse_mean = torch.stack(loss_mse_list).mean() if len(loss_mse_list) > 0 else torch.tensor(0.0)
+                    loss_sw_mean = torch.stack(loss_sw_list).mean() if (use_sw and len(loss_sw_list) > 0) else None
                 if lambda_reg > 0:
                     reg_loss_mean = torch.stack(reg_loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()
+
                 if lambda_reg > 0 and lambda_loss > 0:
-                    logging.info(
-                        f"layer {i} epoch {epoch} \t|| MSE loss: {loss_mean}\t reg loss: {reg_loss_mean}\t"
-                        f"norm: {norm_mean}\tmax memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
-                    )
+                    if use_sw and loss_sw_mean is not None:
+                        logging.info(
+                            f"layer {i} epoch {epoch} || loss: {loss_mean} mse: {loss_mse_mean} sw: {loss_sw_mean} "
+                            f"reg: {reg_loss_mean} norm: {norm_mean} "
+                            f"max memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
+                        )
+                    else:
+                        logging.info(
+                            f"layer {i} epoch {epoch} || loss: {loss_mean} mse: {loss_mse_mean} "
+                            f"reg: {reg_loss_mean} norm: {norm_mean} "
+                            f"max memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
+                        )
                 elif lambda_loss > 0:
-                    logging.info(
-                        f"layer {i} epoch {epoch} \t|| MSE loss: {loss_mean}\t"
-                        f"norm: {norm_mean}\tmax memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
-                    )
+                    if use_sw and loss_sw_mean is not None:
+                        logging.info(
+                            f"layer {i} epoch {epoch} || loss: {loss_mean} mse: {loss_mse_mean} sw: {loss_sw_mean} "
+                            f"norm: {norm_mean} "
+                            f"max memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
+                        )
+                    else:
+                        logging.info(
+                            f"layer {i} epoch {epoch} || loss: {loss_mean} mse: {loss_mse_mean} "
+                            f"norm: {norm_mean} "
+                            f"max memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
+                        )
                 elif lambda_reg > 0:
                     logging.info(
-                        f"layer {i} epoch {epoch} \t|| reg loss: {reg_loss_mean}\t"
-                        f"norm: {norm_mean}\tmax memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
+                        f"layer {i} epoch {epoch} || reg loss: {reg_loss_mean} "
+                        f"norm: {norm_mean} "
+                        f"max memory_allocated: {torch.cuda.max_memory_allocated(args.device) / 1024**2}"
                     )
                 else:
                     raise ValueError(
